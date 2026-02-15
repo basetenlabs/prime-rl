@@ -137,12 +137,20 @@ def compute_topk_tail_distill_loss(
     # .clamp_min(eps) replaces every element of x that is smaller than eps with eps
     # mathematically equivalent to x = max(x, eps) or alternatively x = torch.where(x < eps, eps, x)
     # TO-DO: I couldn't find it in the docs, so maybe the correct use is x = torch.clamp(x, min=eps)
+
+    # converts logits to probabilities over softmax
+    # float() improves numerical stability beforre softmax/log ops
+    # need to use clamp_min() to avoid exact zeros, because we later take logs
     student_probs = torch.softmax(student_logits.float(), dim=-1).clamp_min(eps)
     teacher_probs = torch.softmax(teacher_logits.float(), dim=-1).clamp_min(eps)
 
+    # If caller asks for K bigger than vocab size, clamp it to vocab size
     top_k = min(top_k, student_probs.shape[-1])
+    # Selects indices of top-K from the student distribution only
     topk_indices = torch.topk(student_probs, k=top_k, dim=-1).indices
+    # Extracts student probabilities at the same student-chosen indices
     student_topk = torch.gather(student_probs, dim=-1, index=topk_indices).clamp_min(eps)
+    # Extracts teacher probabilities at the same student-chosen indices
     teacher_topk = torch.gather(teacher_probs, dim=-1, index=topk_indices).clamp_min(eps)
 
     # Summing over dim=-1 sums over the vocab, so we get a tensor of shape (batch, seq) where each element is the probability mass of the top-K tokens
@@ -152,9 +160,11 @@ def compute_topk_tail_distill_loss(
     student_tail_mass = (1.0 - student_topk_mass).clamp_min(eps)
     teacher_tail_mass = (1.0 - teacher_topk_mass).clamp_min(eps)
 
+    # coarse-grained forward KL
     forward_kl = (teacher_topk * (teacher_topk.log() - student_topk.log())).sum(dim=-1) + teacher_tail_mass * (
         teacher_tail_mass.log() - student_tail_mass.log()
     )
+    # coarse-grained reverse KL
     reverse_kl = (student_topk * (student_topk.log() - teacher_topk.log())).sum(dim=-1) + student_tail_mass * (
         student_tail_mass.log() - teacher_tail_mass.log()
     )
@@ -164,7 +174,7 @@ def compute_topk_tail_distill_loss(
     if divergence == "reverse_kl":
         return reverse_kl
     if divergence == "symmetric":
-        # If divergence is symmetric, we calculate the Jensen
+        # Convex combination of forward and reverse KL divergences
         return symmetric_mix * forward_kl + (1.0 - symmetric_mix) * reverse_kl
     raise ValueError(f"Unsupported divergence: {divergence}")
 
