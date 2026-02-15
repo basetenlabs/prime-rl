@@ -24,8 +24,10 @@ from prime_rl.orchestrator.config import OrchestratorConfig
 from prime_rl.trainer.config import CheckpointConfig as TrainerCheckpointConfig
 from prime_rl.trainer.rl.config import FakeDataLoaderConfig
 from prime_rl.trainer.rl.config import FileSystemWeightBroadcastConfig as TrainerFileSystemWeightBroadcastConfig
+from prime_rl.trainer.rl.config import LossConfig
 from prime_rl.trainer.rl.config import NCCLWeightBroadcastConfig as TrainerNCCLWeightBroadcastConfig
 from prime_rl.trainer.rl.config import RLTrainerConfig as TrainerConfig
+from prime_rl.trainer.rl.config import SelfDistillLossConfig
 from prime_rl.utils.config import WandbConfig, WandbWithExtrasConfig
 from prime_rl.utils.logger import setup_logger
 from prime_rl.utils.pydantic_config import BaseSettings, parse_argv
@@ -508,6 +510,32 @@ class RLConfig(BaseSettings):
         return self
 
     @model_validator(mode="after")
+    def validate_self_distill_mode(self):
+        if not isinstance(self.trainer.loss, SelfDistillLossConfig):
+            if self.orchestrator.self_distill:
+                raise ValueError("orchestrator.self_distill requires trainer.loss.type = 'self_distill'.")
+            return self
+
+        self.orchestrator.self_distill = True
+
+        if self.trainer.max_async_level != 0 or self.orchestrator.max_async_level != 0:
+            raise ValueError(
+                "Self-distillation mode requires strict on-policy execution: "
+                "trainer.max_async_level = 0 and orchestrator.max_async_level = 0."
+            )
+
+        self.orchestrator.max_off_policy_steps = 0
+
+        if self.orchestrator.teacher_model is not None:
+            raise ValueError("Self-distillation mode does not support orchestrator.teacher_model.")
+        if self.teacher_inference is not None:
+            raise ValueError("Self-distillation mode does not support teacher_inference.")
+        if self.teacher_gpu_ids:
+            raise ValueError("Self-distillation mode does not support teacher_gpu_ids.")
+
+        return self
+
+    @model_validator(mode="after")
     def auto_setup_teacher_inference(self):
         """Auto-configure teacher inference server and orchestrator teacher_model client."""
         if self.teacher_gpu_ids is None or len(self.teacher_gpu_ids) == 0:
@@ -551,7 +579,11 @@ class RLConfig(BaseSettings):
 
     @model_validator(mode="after")
     def validate_teacher_model(self):
-        if self.trainer.loss.teacher_tau > 0 and not self.orchestrator.teacher_model:
+        if (
+            isinstance(self.trainer.loss, LossConfig)
+            and self.trainer.loss.teacher_tau > 0
+            and not self.orchestrator.teacher_model
+        ):
             raise ValueError(
                 "teacher_model must be configured when teacher_tau > 0. "
                 "Either set teacher_tau = 0, set teacher_gpu_ids, or configure teacher_model manually."
@@ -783,7 +815,10 @@ def rl(config: RLConfig):
             )
             monitor_thread.start()
             monitor_threads.append(monitor_thread)
-        elif config.trainer.loss.teacher_tau > 0 or config.orchestrator.teacher_model:
+        elif (
+            (isinstance(config.trainer.loss, LossConfig) and config.trainer.loss.teacher_tau > 0)
+            or config.orchestrator.teacher_model
+        ):
             logger.warning(
                 "No teacher_inference config specified, skipping starting teacher inference server. "
                 "Is your teacher inference server running? Make sure orchestrator.teacher_model is configured."

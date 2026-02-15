@@ -133,6 +133,10 @@ class CheckpointManager:
         """Get the path to write the trainer checkpoint for a given step."""
         return get_step_path(self.ckpt_dir, step) / "trainer"
 
+    def get_ema_path(self, step: int) -> Path:
+        """Get the path to write rank-local EMA checkpoint state for a given step."""
+        return self.get_ckpt_path(step) / "ema" / f"rank_{self.world.rank}.pt"
+
     def mark_stable(self, step: int) -> None:
         """Write STABLE file to indicate checkpoint is complete (for eval to safely read)."""
         if self.world.is_master:
@@ -236,6 +240,22 @@ class CheckpointManager:
 
         self.save_to_path(ckpt_path, model, optimizers, scheduler, progress, dataloader)
         bisect.insort(self.ckpt_steps, step)
+
+    def save_ema(self, step: int, ema_state: list[Tensor]) -> None:
+        path = self.get_ema_path(step)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save([tensor.detach().cpu() for tensor in ema_state], path)
+
+    def load_ema(self, step: int, map_location: str | torch.device) -> list[Tensor] | None:
+        path = self.get_ema_path(step)
+        if not path.exists():
+            return None
+        ema_state = torch.load(path, map_location=map_location)
+        if not isinstance(ema_state, list):
+            raise ValueError(f"Expected EMA state list at {path}, got {type(ema_state)}")
+        if not all(isinstance(tensor, Tensor) for tensor in ema_state):
+            raise ValueError(f"Invalid EMA state at {path}: expected list[Tensor]")
+        return ema_state
 
     def maybe_clean(self) -> None:
         """Deletes past checkpoints based on keep_last and keep_interval policies. No-op if both are None."""

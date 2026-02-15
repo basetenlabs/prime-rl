@@ -9,6 +9,7 @@ from prime_rl.orchestrator.advantage import compute_advantages
 from prime_rl.orchestrator.eval_utils import get_eval_sampling_args
 from prime_rl.orchestrator.event_loop_lag import EventLoopLagMonitor
 from prime_rl.orchestrator.patches import monkey_patch_chat_completion_logprobs, monkey_patch_oai_iterable_types
+from prime_rl.orchestrator.self_distill_context import build_example_lookup, build_teacher_prompt
 from prime_rl.orchestrator.trajectories import build_vlm_image_cache, interleave_rollout
 from prime_rl.transport import TrainingBatch, TrainingSample, setup_training_batch_sender
 from prime_rl.utils.pathing import get_log_dir
@@ -226,6 +227,12 @@ async def orchestrate(config: OrchestratorConfig):
     # Setup buffer
     logger.info(f"Setting up buffer ({config.buffer})")
     train_dataset = train_env_group.get_dataset(seed=config.buffer.seed)
+    self_distill_example_lookup = None
+    self_distill_teacher_prompt_cache: dict[int, list[int]] = {}
+    if config.self_distill:
+        self_distill_example_lookup = build_example_lookup(train_dataset)
+        logger.info(f"Loaded self-distill context lookup for {len(self_distill_example_lookup)} dataset examples")
+
     buffer = Buffer(train_dataset, train_env_group.env_names, config.buffer)
     if config.val is not None:
         val_buffer_config = BufferConfig(env_ratios=config.buffer.env_ratios)
@@ -477,9 +484,22 @@ async def orchestrate(config: OrchestratorConfig):
         train_examples: list[TrainingSample] = []
         for rollout, advantage, samples in zip(train_rollouts, advantages, results):
             if samples is not None:
+                teacher_prompt_ids = None
+                if config.self_distill:
+                    assert self_distill_example_lookup is not None
+                    example_id = rollout["example_id"]
+                    if example_id not in self_distill_teacher_prompt_cache:
+                        teacher_prompt = build_teacher_prompt(self_distill_example_lookup, example_id)
+                        self_distill_teacher_prompt_cache[example_id] = tokenizer.encode(
+                            teacher_prompt, add_special_tokens=False
+                        )
+                    teacher_prompt_ids = self_distill_teacher_prompt_cache[example_id]
+
                 for sample in samples:
                     sample.advantage = advantage
                     sample.reward = rollout["reward"]
+                    if teacher_prompt_ids is not None:
+                        sample.teacher_prompt_ids = teacher_prompt_ids.copy()
                 train_examples.extend(samples)
 
         parallel_preprocess_time = time.perf_counter() - parallel_preprocess_start
@@ -490,7 +510,7 @@ async def orchestrate(config: OrchestratorConfig):
 
         # Compute teacher logprobs if teacher model is configured
         teacher_logprobs_time = 0
-        if config.teacher_model and teacher_inference_pool:
+        if not config.self_distill and config.teacher_model and teacher_inference_pool:
             logger.info(f"Computing teacher logprobs for {len(train_examples)} training examples")
             teacher_logprobs_start_time = time.perf_counter()
             teacher_logprobs_list = await compute_teacher_logprobs(

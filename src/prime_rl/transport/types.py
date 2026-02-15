@@ -12,6 +12,7 @@ class TrainingSample(msgspec.Struct, array_like=True, gc=False, omit_defaults=Tr
     completion_logprobs: list[float]
     completion_temperatures: list[float]  # Per-token temperatures used during generation
     teacher_logprobs: list[float] | None = None
+    teacher_prompt_ids: list[int] | None = None
     advantage: float | None = None
     reward: float | None = None
 
@@ -40,7 +41,9 @@ class MicroBatch(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
     inference_logprobs: list[float]
     position_ids: list[int]
     temperatures: list[float]  # Per-token temperatures used during generation
+    generated_mask: list[bool] | None = None
     teacher_logprobs: list[float] | None = None
+    teacher_prompt_ids: list[list[int]] | None = None
     lora_num_tokens: list[int] | None = None
 
     # Multimodal fields (Qwen3-VL)

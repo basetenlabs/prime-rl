@@ -616,6 +616,13 @@ class OrchestratorConfig(BaseSettings):
         ),
     ] = None
 
+    self_distill: Annotated[
+        bool,
+        Field(
+            description="Whether to attach demonstration-conditioned teacher prompts to training samples."
+        ),
+    ] = False
+
     # The sampling configuration
     sampling: SamplingConfig = SamplingConfig()
 

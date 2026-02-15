@@ -22,6 +22,8 @@ class TensorMicroBatch(TypedDict):
     advantages: Float[Tensor, "batch seq"]
     inference_logprobs: Float[Tensor, "batch seq"]
     teacher_logprobs: Float[Tensor, "batch seq"] | None
+    teacher_prompt_ids: list[list[int]] | None
+    generated_mask: Bool[Tensor, "batch seq"]
     loss_mask: Bool[Tensor, "batch seq"]
     temperatures: Float[Tensor, "batch seq"]  # Per-token temperatures
 
@@ -99,6 +101,8 @@ class FakeDataLoader:
             "advantages": advantages.unsqueeze(0),
             "inference_logprobs": inference_logprobs.unsqueeze(0),
             "teacher_logprobs": None,
+            "teacher_prompt_ids": [[]],
+            "generated_mask": loss_mask.unsqueeze(0),
             "temperatures": torch.ones(input_ids.shape[0]).unsqueeze(0),
             "loss_mask": loss_mask.unsqueeze(0),
             "lora_num_tokens": lora_num_tokens,
@@ -123,6 +127,8 @@ class FakeDataLoader:
             "advantages": torch.randn(self.seq_len, generator=generator).unsqueeze(0),
             "inference_logprobs": torch.randn(self.seq_len, generator=generator).unsqueeze(0),
             "teacher_logprobs": None,
+            "teacher_prompt_ids": [[]],
+            "generated_mask": torch.ones(self.seq_len, dtype=torch.bool).unsqueeze(0),
             "temperatures": torch.ones(self.seq_len).unsqueeze(0),
             "loss_mask": torch.ones(self.seq_len, dtype=torch.bool).unsqueeze(0),
             "lora_num_tokens": lora_num_tokens,
@@ -185,6 +191,10 @@ class DataLoader:
             teacher_logprobs=torch.tensor(micro_batch.teacher_logprobs, dtype=torch.float).unsqueeze(0)
             if micro_batch.teacher_logprobs is not None
             else None,
+            teacher_prompt_ids=micro_batch.teacher_prompt_ids,
+            generated_mask=torch.tensor(micro_batch.generated_mask, dtype=torch.bool).unsqueeze(0)
+            if micro_batch.generated_mask is not None
+            else torch.tensor(micro_batch.loss_mask, dtype=torch.bool).unsqueeze(0),
             loss_mask=torch.tensor(micro_batch.loss_mask, dtype=torch.bool).unsqueeze(0),
             temperatures=torch.tensor(micro_batch.temperatures, dtype=torch.float).unsqueeze(0),
             lora_num_tokens=torch.tensor(micro_batch.lora_num_tokens, dtype=torch.int32),

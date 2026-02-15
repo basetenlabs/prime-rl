@@ -66,6 +66,8 @@ import_path = "my_module.ppo_clip_loss"
 kwargs = { clip_eps = 0.2 }
 ```
 
+`trainer.loss.type = "self_distill"` is a dedicated built-in training branch (EMA teacher + teacher prompts + top-k tail KL) and does not use the custom per-sequence `LossInputs` interface. See [on_policy_distillation.md](on_policy_distillation.md).
+
 ---
 
 ## 2. Custom Advantage Functions

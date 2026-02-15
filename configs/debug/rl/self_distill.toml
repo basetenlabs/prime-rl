@@ -1,0 +1,16 @@
+max_steps = 5
+max_async_level = 0
+
+[data.fake]
+batch_size = 2
+
+[model]
+seq_len = 1024
+fused_lm_head_chunk_size = "disabled"
+
+[loss]
+type = "self_distill"
+divergence = "reverse_kl"
+top_k = 64
+ema_alpha = 0.01
+loss_mask_prefix_tokens = 0

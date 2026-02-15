@@ -1,73 +1,56 @@
 # On-Policy Distillation
 
-On-policy distillation uses a teacher model to provide dense token-level feedback during RL training. The student generates rollouts, and the teacher's logprobs guide the student to stay close to stronger behavior while still learning from rewards.
+Prime-RL supports a built-in demonstration-conditioned self-distillation mode that replaces reward-derived advantages + PPO/GRPO-style loss with token-level KL distillation against an EMA teacher.
 
-For more details, see [On-Policy Distillation](https://thinkingmachines.ai/blog/on-policy-distillation/) by Thinking Machines.
+## Self-Distill Mode
 
-## Quick Start
-
-Add `teacher_gpu_ids` and set `teacher_tau > 0`:
+Use the dedicated loss type:
 
 ```toml
-teacher_gpu_ids = [2, 3]
+[trainer]
+max_async_level = 0
 
 [trainer.loss]
-teacher_tau = 0.5
+type = "self_distill"
+divergence = "reverse_kl"  # "forward_kl" | "reverse_kl" | "symmetric"
+top_k = 64
+ema_alpha = 0.01
+loss_mask_prefix_tokens = 0
+symmetric_mix = 0.5
+
+[orchestrator]
+max_async_level = 0
+max_off_policy_steps = 0
 ```
 
-This automatically starts a teacher inference server using the same model as inference. To use a different teacher model:
+In this mode:
 
-```toml
-teacher_gpu_ids = [2, 3]
+- teacher inference servers are disabled (`teacher_gpu_ids`, `teacher_inference`, and `orchestrator.teacher_model` must not be used);
+- training is strict on-policy (`trainer.max_async_level = 0`, `orchestrator.max_async_level = 0`);
+- `orchestrator.max_off_policy_steps` is forced to `0`.
 
-[teacher_inference.model]
-name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
+## Dataset Requirement
 
-[trainer.loss]
-teacher_tau = 0.5
-```
+Self-distill mode requires OpenAI-style `messages` in the training dataset.
 
-## Using an External Teacher Server
-
-If the teacher is already running elsewhere:
-
-```toml
-[trainer.loss]
-teacher_tau = 0.5
-
-[orchestrator.teacher_model.client]
-base_url = ["http://teacher-server:8000/v1"]
-
-[orchestrator.teacher_model.model]
-name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
-```
-
-## Pure Distillation (No Verification)
-
-For agentic environments where verification is expensive (code execution, tool use, multi-turn interactions), you can skip verification entirely and use only the teacher signal:
-
-```toml
-teacher_gpu_ids = [2, 3]
-
-[trainer.loss]
-teacher_tau = 1.0
-adv_tau = 0.0  # Disable reward-based learning
-
-[orchestrator.buffer]
-skip_verification = true  # Skip expensive verification
-```
-
-This runs pure on-policy distillation: the student learns to match the teacher without needing any reward signal.
+- `x` is the conversation up to and including the final user message before the final assistant message.
+- `c` is the final assistant message.
+- non-text or multimodal/structured message content is rejected in v1.
 
 ## Parameters
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `teacher_gpu_ids` | `None` | GPUs for teacher server. Auto-starts server when set. |
-| `trainer.loss.teacher_tau` | `0.0` | Distillation strength. Set `> 0` to enable. |
-| `trainer.loss.adv_tau` | `1.0` | Weight for RL advantage signal. Set `0` for pure distillation. |
-| `orchestrator.buffer.skip_verification` | `false` | Skip verification. Use with `adv_tau = 0`. |
+| `trainer.loss.type` | `"default"` | Set to `"self_distill"` to enable demonstration-conditioned distillation mode. |
+| `trainer.loss.divergence` | `"reverse_kl"` | Distillation divergence: `forward_kl`, `reverse_kl`, or `symmetric`. |
+| `trainer.loss.top_k` | `64` | Student-selected Top-K for KL approximation. |
+| `trainer.loss.ema_alpha` | `0.01` | EMA update factor for the teacher weights after each optimizer step. |
+| `trainer.loss.loss_mask_prefix_tokens` | `0` | Masks first N generated tokens from distillation loss (per sequence). |
+| `trainer.loss.symmetric_mix` | `0.5` | Mix coefficient for `symmetric` divergence. |
 
 ## Monitoring
 
-The `teacher_kl` metric shows the KL divergence from teacher to student. Lower values mean the student is closer to the teacher.
+Self-distill mode logs:
+
+- `distill_kl`: per-token KL values used by the distillation objective;
+- `distill_tokens`: number of distillation tokens in the microbatch.

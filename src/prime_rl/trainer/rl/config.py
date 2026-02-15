@@ -81,6 +81,35 @@ class CustomLossConfig(BaseModel):
     kwargs: Annotated[dict[str, Any], Field(default_factory=dict, description="Kwargs to pass to the loss function")]
 
 
+class SelfDistillLossConfig(BaseConfig):
+    """Config for demonstration-conditioned on-policy self-distillation."""
+
+    type: Literal["self_distill"] = "self_distill"
+    divergence: Annotated[
+        Literal["forward_kl", "reverse_kl", "symmetric"],
+        Field(description="Divergence used for distillation."),
+    ] = "reverse_kl"
+    top_k: Annotated[
+        int,
+        Field(
+            ge=1,
+            description="Top-K indices selected from the student distribution at each generated token position.",
+        ),
+    ] = 64
+    ema_alpha: Annotated[
+        float,
+        Field(gt=0, le=1, description="EMA interpolation factor for teacher parameters."),
+    ] = 0.01
+    loss_mask_prefix_tokens: Annotated[
+        int,
+        Field(ge=0, description="Mask the first N generated tokens from distillation loss."),
+    ] = 0
+    symmetric_mix: Annotated[
+        float,
+        Field(ge=0, le=1, description="Mix coefficient for symmetric divergence mode."),
+    ] = 0.5
+
+
 def _loss_config_discriminator(v: Any) -> str:
     if isinstance(v, dict):
         return v.get("type", "default")
@@ -88,7 +117,9 @@ def _loss_config_discriminator(v: Any) -> str:
 
 
 LossConfigType: TypeAlias = Annotated[
-    Annotated[LossConfig, Tag("default")] | Annotated[CustomLossConfig, Tag("custom")],
+    Annotated[LossConfig, Tag("default")]
+    | Annotated[CustomLossConfig, Tag("custom")]
+    | Annotated[SelfDistillLossConfig, Tag("self_distill")],
     Discriminator(_loss_config_discriminator),
 ]
 
@@ -299,8 +330,17 @@ class RLTrainerConfig(BaseSettings):
     @model_validator(mode="after")
     def auto_setup_fused_lm_head_chunk_size(self):
         if self.model.fused_lm_head_chunk_size == "auto":
-            self.model.fused_lm_head_chunk_size = 2048
+            if isinstance(self.loss, SelfDistillLossConfig):
+                self.model.fused_lm_head_chunk_size = "disabled"
+            else:
+                self.model.fused_lm_head_chunk_size = 2048
 
+        return self
+
+    @model_validator(mode="after")
+    def validate_self_distill_single_run(self):
+        if isinstance(self.loss, SelfDistillLossConfig) and self.max_concurrent_runs > 1:
+            raise ValueError("Self-distillation mode requires max_concurrent_runs = 1")
         return self
 
     @model_validator(mode="after")

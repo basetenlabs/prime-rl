@@ -6,7 +6,7 @@ from prime_rl.transport.types import TrainingSample
 
 @pytest.fixture
 def make_training_example():
-    def _make_training_example(temperature: float = 1.0) -> TrainingSample:
+    def _make_training_example(temperature: float = 1.0, teacher_prompt_ids: list[int] | None = None) -> TrainingSample:
         return TrainingSample(
             prompt_ids=[1, 2],
             prompt_mask=[False, False],
@@ -15,6 +15,7 @@ def make_training_example():
             completion_logprobs=[-0.1, -0.2],
             completion_temperatures=[temperature, temperature],  # Per-token temperatures
             teacher_logprobs=[0.0, 0.0, 0.0, 0.0],
+            teacher_prompt_ids=teacher_prompt_ids,
             advantage=1.0,
         )
 
@@ -77,3 +78,23 @@ def test_prepare_batch_packs_different_temperatures(make_training_example):
     assert flat_batches[0].temperatures[:4] == [0.7, 0.7, 0.7, 0.7]
     # Second sample (4 tokens): all get temp 1.1
     assert flat_batches[0].temperatures[4:8] == [1.1, 1.1, 1.1, 1.1]
+
+
+def test_prepare_batch_packs_teacher_prompts_and_generated_mask(make_training_example):
+    example1 = make_training_example(temperature=0.7, teacher_prompt_ids=[101, 102])
+    example2 = make_training_example(temperature=1.1, teacher_prompt_ids=[201, 202, 203])
+
+    batches_per_gpu = prepare_batch(
+        rollouts=[example1, example2],
+        seq_len=16,
+        num_train_workers=1,
+        idxs=[0, 0],
+        num_loras=1,
+    )
+
+    flat_batches = [batch for worker_batches in batches_per_gpu for batch in worker_batches]
+    assert len(flat_batches) == 1
+    batch = flat_batches[0]
+
+    assert batch.teacher_prompt_ids == [[101, 102], [201, 202, 203]]
+    assert batch.generated_mask == [False, False, True, True, False, False, True, True]
