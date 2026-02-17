@@ -29,6 +29,9 @@ name = "Qwen/Qwen2.5-7B-Instruct"
 max_concurrent_runs = 1
 dist_timeout_seconds = 1800
 
+[trainer.tokenizer]
+name = "Qwen/Qwen2.5-7B-Instruct"
+
 [trainer.model]
 fused_lm_head_chunk_size = "disabled"
 attn = "flash_attention_2"
