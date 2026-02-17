@@ -8,8 +8,8 @@
 output_dir = "outputs/self-distill-tooluse"
 inference_gpu_ids = [0, 1]
 trainer_gpu_ids = [2, 3, 4, 5, 6, 7]
-seq_len = 2048
-max_steps = 1000
+seq_len = 4096
+max_steps = 127
 max_async_level = 0
 
 [wandb]
@@ -17,7 +17,7 @@ project = "self-distill-replication"
 name = "tooluse-forward-kl"
 
 [ckpt]
-interval = 100
+interval = 50
 keep_last = 3
 
 [model]
@@ -27,6 +27,7 @@ name = "Qwen/Qwen2.5-7B-Instruct"
 
 [trainer]
 max_concurrent_runs = 1
+dist_timeout_seconds = 1800
 
 [trainer.model]
 fused_lm_head_chunk_size = "disabled"
@@ -43,7 +44,7 @@ max_norm = 1.0
 
 [trainer.scheduler]
 type = "cosine"
-warmup_steps = 100
+warmup_steps = 13
 min_lr = 0.0
 
 [trainer.loss]
@@ -68,6 +69,22 @@ max_tokens = 1024
 [[orchestrator.env]]
 id = "tooluse-self-distill"
 name = "tooluse"
+args = { dataset_path = "replication_data/converted/train_data.json", eval_dataset_path = "replication_data/converted/eval_data.json" }
+
+[orchestrator.val]
+interval = 25
+num_examples = 68
+
+[orchestrator.eval]
+interval = 50
+
+[orchestrator.eval.sampling]
+max_tokens = 1024
+
+[[orchestrator.eval.env]]
+id = "tooluse-self-distill"
+name = "tooluse"
+num_examples = 68
 args = { dataset_path = "replication_data/converted/train_data.json", eval_dataset_path = "replication_data/converted/eval_data.json" }
 
 # --- Inference ---

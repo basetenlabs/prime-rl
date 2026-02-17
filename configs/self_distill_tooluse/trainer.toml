@@ -1,0 +1,26 @@
+# Trainer config for self-distillation replication
+max_concurrent_runs = 1
+
+[model]
+fused_lm_head_chunk_size = "disabled"
+attn = "flash_attention_2"
+
+[model.ac]
+
+[optim]
+type = "adamw"
+lr = 2e-5
+weight_decay = 0.01
+max_norm = 1.0
+
+[scheduler]
+type = "cosine"
+warmup_steps = 100
+min_lr = 0.0
+
+[loss]
+type = "self_distill"
+divergence = "forward_kl"
+top_k = 64
+ema_alpha = 0.01
+loss_mask_prefix_tokens = 3
