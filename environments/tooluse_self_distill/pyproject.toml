@@ -1,0 +1,15 @@
+[project]
+name = "tooluse-self-distill"
+version = "0.1.0"
+description = "Tool-use environment for self-distillation replication (ToolAlpaca)"
+dependencies = [
+    "verifiers>=0.1.5.post0",
+    "datasets",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build]
+include = ["tooluse_self_distill.py"]

@@ -33,6 +33,7 @@ dependencies = [
     "verifiers",
     "dion",
     "reverse-text",
+    "tooluse-self-distill",
 ]
 
 [project.scripts]
@@ -84,6 +85,7 @@ transformers = { git = "https://github.com/huggingface/transformers.git", rev = 
 vllm = { url = "https://github.com/vllm-project/vllm/releases/download/v0.16.0/vllm-0.16.0-cp38-abi3-manylinux_2_31_x86_64.whl" }
 flash-attn-cute = { git = "https://github.com/Dao-AILab/flash-attention.git", subdirectory = "flash_attn/cute", rev = "main" }
 reverse-text = { index = "primeintellect" }
+tooluse-self-distill = { path = "environments/tooluse_self_distill" }
 
 [tool.uv.extra-build-dependencies]
 flash-attn = [{ requirement = "torch", match-runtime = true }]
