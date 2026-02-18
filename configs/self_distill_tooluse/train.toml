@@ -75,7 +75,7 @@ name = "tooluse"
 args = { dataset_path = "replication_data/converted/train_data.json", eval_dataset_path = "replication_data/converted/eval_data.json" }
 
 [orchestrator.val]
-interval = 25
+interval = 10
 num_examples = 68
 
 [orchestrator.eval]

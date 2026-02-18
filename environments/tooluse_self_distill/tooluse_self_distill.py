@@ -22,11 +22,13 @@ def load_environment(
     train_data = _load_json(dataset_path)
     train_rows = []
     for item in train_data:
+        golden_answer = _extract_golden_answer(item["messages"])
         train_rows.append(
             {
                 "example_id": item["example_id"],
                 "question": item["messages"][0]["content"],
                 "messages": item["messages"],
+                "info": {"golden_answer": golden_answer},
                 "task": task_name,
             }
         )
@@ -48,17 +50,21 @@ def load_environment(
             )
         eval_dataset = Dataset.from_list(eval_rows)
 
-    def zero_reward(**kwargs) -> float:
-        return 0.0
-
-    rubric = vf.Rubric(funcs=[zero_reward])
-    rubric.add_metric(_tool_call_accuracy)
+    rubric = vf.Rubric(funcs=[_tool_call_accuracy])
 
     return vf.SingleTurnEnv(
         dataset=train_dataset,
         eval_dataset=eval_dataset,
         rubric=rubric,
     )
+
+
+def _extract_golden_answer(messages: list[dict]) -> list[dict]:
+    """Extract golden tool calls from the final assistant message in a conversation."""
+    for msg in reversed(messages):
+        if msg.get("role") == "assistant":
+            return _parse_tool_calls(msg.get("content", ""))
+    return []
 
 
 def _load_json(path: str) -> list[dict]:
