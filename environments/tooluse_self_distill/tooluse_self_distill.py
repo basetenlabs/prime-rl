@@ -96,8 +96,12 @@ def _tool_call_accuracy(completion, **kwargs) -> float:
     return correct / len(golden)
 
 
+_SPECIAL_TOKEN_RE = re.compile(r"<\|[^|]+\|>")
+
+
 def _parse_tool_calls(text: str) -> list[dict]:
     """Extract Action/Action_Input pairs from model output."""
+    text = _SPECIAL_TOKEN_RE.sub("", text)
     results = []
     for match in re.finditer(
         r"Action:\s*(\S+)\s*\n\s*Action\s*Input:\s*(.+?)(?=\nAction:|\n*$)",
