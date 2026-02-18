@@ -445,11 +445,23 @@ async def orchestrate(config: OrchestratorConfig):
         generate_completions_time = scheduler.last_batch_generation_time
         train_rollouts = train_task.result()
 
-        # Log the first rollout's completion for debugging
+        # Log the first rollout's completion, teacher prompt, and golden answer for debugging
         if train_rollouts and train_rollouts[0].get("trajectory"):
-            first_traj = train_rollouts[0]["trajectory"][-1]
+            first_rollout = train_rollouts[0]
+            first_eid = first_rollout["example_id"]
+            first_traj = first_rollout["trajectory"][-1]
             first_completion = tokenizer.decode(first_traj["tokens"]["completion_ids"])
-            logger.info(f"Sample rollout (example_id={train_rollouts[0]['example_id']}, reward={train_rollouts[0]['reward']:.2f}):\n{first_completion}")
+            log_parts = [f"Sample rollout (example_id={first_eid}, reward={first_rollout['reward']:.2f}):"]
+            if self_distill_example_lookup and first_eid in self_distill_example_lookup:
+                example = self_distill_example_lookup[first_eid]
+                teacher_prompt = build_teacher_prompt(self_distill_example_lookup, first_eid)
+                log_parts.append(f"--- Teacher Prompt ---\n{teacher_prompt}")
+                for msg in reversed(example.get("messages", [])):
+                    if msg.get("role") == "assistant":
+                        log_parts.append(f"--- Golden Answer ---\n{msg['content']}")
+                        break
+            log_parts.append(f"--- Student Completion ---\n{first_completion}")
+            logger.info("\n".join(log_parts))
 
         # Compute advantages
         example_ids = [r["example_id"] for r in train_rollouts]
