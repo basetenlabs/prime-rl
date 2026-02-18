@@ -239,6 +239,12 @@ def _compute_self_distill_microbatch_loss(
         distill_kl = torch.cat(distill_token_losses, dim=0)
     else:
         distill_kl = torch.zeros(0, device=input_ids.device, dtype=torch.float32)
+        # When no tokens survive the effective mask, total_distill_loss is a plain zero with no
+        # grad_fn. Backward on a detached scalar crashes, and — worse — the missing FSDP allgather
+        # collectives deadlock every other rank. Multiplying by 0.0 through the student logits
+        # keeps the tensor on the computation graph so backward issues the same collectives as
+        # every other rank while contributing zero gradient.
+        total_distill_loss = total_distill_loss + 0.0 * student_aligned_logits.sum()
     distill_tokens = torch.tensor([float(distill_kl.numel())], device=input_ids.device, dtype=torch.float32)
 
     scaled_loss = total_distill_loss / loss_scale

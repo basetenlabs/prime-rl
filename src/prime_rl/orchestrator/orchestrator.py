@@ -445,6 +445,12 @@ async def orchestrate(config: OrchestratorConfig):
         generate_completions_time = scheduler.last_batch_generation_time
         train_rollouts = train_task.result()
 
+        # Log the first rollout's completion for debugging
+        if train_rollouts and train_rollouts[0].get("trajectory"):
+            first_traj = train_rollouts[0]["trajectory"][-1]
+            first_completion = tokenizer.decode(first_traj["tokens"]["completion_ids"])
+            logger.info(f"Sample rollout (example_id={train_rollouts[0]['example_id']}, reward={train_rollouts[0]['reward']:.2f}):\n{first_completion}")
+
         # Compute advantages
         example_ids = [r["example_id"] for r in train_rollouts]
         rewards = [r["reward"] for r in train_rollouts]

@@ -92,5 +92,8 @@ args = { dataset_path = "replication_data/converted/train_data.json", eval_datas
 
 # --- Inference ---
 
+[inference.model]
+max_model_len = 2048
+
 [inference.parallel]
 dp = 2
