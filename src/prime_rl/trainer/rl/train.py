@@ -139,12 +139,13 @@ def _compute_self_distill_microbatch_loss(
         teacher_prompt = torch.tensor(seq_teacher_prompt_ids, dtype=torch.long, device=input_ids.device)
         teacher_input = torch.cat([teacher_prompt, seq_input_ids], dim=0)
         if teacher_input.numel() > config.model.seq_len:
-            raise RuntimeError(
-                "Self-distill teacher input exceeds configured sequence length: "
+            logger.warning(
+                "Skipping self-distill teacher sequence that exceeds seq_len: "
                 f"run_idx={run_idx}, step={step}, micro_step={micro_step}, sequence_index={seq_idx}, "
                 f"teacher_prompt_tokens={teacher_prompt.numel()}, continuation_tokens={seq_input_ids.numel()}, "
                 f"total_teacher_tokens={teacher_input.numel()}, model_seq_len={config.model.seq_len}"
             )
+            continue
         teacher_sequences.append(teacher_input)
         teacher_pos_ids_list.append(torch.arange(teacher_input.numel(), device=input_ids.device, dtype=torch.long))
         teacher_seq_lengths.append(teacher_input.numel())
