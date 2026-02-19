@@ -489,7 +489,7 @@ async def orchestrate(config: OrchestratorConfig):
                     assert self_distill_example_lookup is not None
                     example_id = rollout["example_id"]
                     if example_id not in self_distill_teacher_prompt_cache:
-                        teacher_prompt = build_teacher_prompt(self_distill_example_lookup, example_id)
+                        teacher_prompt = build_teacher_prompt(self_distill_example_lookup, example_id, suffix=config.self_distill_suffix)
                         self_distill_teacher_prompt_cache[example_id] = tokenizer.encode(
                             teacher_prompt, add_special_tokens=False
                         )
@@ -549,9 +549,14 @@ async def orchestrate(config: OrchestratorConfig):
         empty_batch_retries = 0
         training_batch_sender.send(training_batch)
 
-        # Await and process val results
-        await val_task
-        val_outputs = val_task.result()
+        # Await and process val results (tolerant of weight-update interruptions)
+        try:
+            await asyncio.wait_for(val_task, timeout=300)
+            val_outputs = val_task.result()
+        except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+            logger.warning("Validation rollout interrupted (likely by weight update), skipping this interval")
+            val_task.cancel()
+            val_outputs = None
 
         # Gather metrics in dataframes
         results_df = pd.DataFrame(

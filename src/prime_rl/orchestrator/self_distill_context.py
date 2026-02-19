@@ -25,7 +25,14 @@ def build_example_lookup(train_dataset: Any) -> dict[int, dict[str, Any]]:
     return example_lookup
 
 
-def build_teacher_prompt(example_lookup: dict[int, dict[str, Any]], example_id: int) -> str:
+_DEFAULT_SUFFIX = "Now answer with a response of your own, including the thinking process:"
+
+
+def build_teacher_prompt(
+    example_lookup: dict[int, dict[str, Any]],
+    example_id: int,
+    suffix: str = _DEFAULT_SUFFIX,
+) -> str:
     if example_id not in example_lookup:
         raise ValueError(f"Failed to build self-distill prompt: example_id={example_id} not found in dataset")
     example = example_lookup[example_id]
@@ -37,7 +44,7 @@ def build_teacher_prompt(example_lookup: dict[int, dict[str, Any]], example_id: 
         "This is an example for a response to the question:\n"
         "<Demonstration>\n"
         f"{demonstration}\n"
-        "Now answer with a response of your own, including the thinking process:"
+        f"{suffix}"
     )
 
 
