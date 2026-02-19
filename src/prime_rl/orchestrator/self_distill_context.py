@@ -3,6 +3,7 @@ from typing import Any
 
 
 _ROLE_TO_TAG = {
+    "system": "SYSTEM",
     "user": "USER",
     "assistant": "ASSISTANT",
     "tool": "TOOL",
