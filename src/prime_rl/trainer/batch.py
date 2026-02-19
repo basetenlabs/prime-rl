@@ -13,6 +13,7 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
     inference_logprobs = [0.0] * len(training_example.prompt_ids) + training_example.completion_logprobs
     advantages = [training_example.advantage] * len(input_ids)
     position_ids = list(range(len(input_ids)))
+    generated_mask = [False] * len(training_example.prompt_ids) + [bool(v) for v in training_example.completion_mask]
 
     # Per-token temperatures: prompt tokens use first completion temp (masked out anyway)
     # Default to 1.0 if completion is empty (e.g., model generated only tool calls with no text)
@@ -22,6 +23,7 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
     # Teacher logprobs already cover the full sequence (prompt + completion),
     # computed via prefill in the orchestrator when a teacher model is configured
     teacher_logprobs = training_example.teacher_logprobs
+    teacher_prompt_ids = [training_example.teacher_prompt_ids] if training_example.teacher_prompt_ids is not None else None
 
     if len(input_ids) > seq_len:
         input_ids = input_ids[:seq_len]
@@ -29,6 +31,7 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
         inference_logprobs = inference_logprobs[:seq_len]
         position_ids = position_ids[:seq_len]
         advantages = advantages[:seq_len]
+        generated_mask = generated_mask[:seq_len]
         temperatures = temperatures[:seq_len]
         if teacher_logprobs is not None:
             teacher_logprobs = teacher_logprobs[:seq_len]
@@ -39,9 +42,10 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
         == len(loss_mask)
         == len(position_ids)
         == len(inference_logprobs)
+        == len(generated_mask)
         == len(temperatures)
     ), (
-        f"input_ids: {len(input_ids)}, advantages: {len(advantages)}, loss_mask: {len(loss_mask)}, position_ids: {len(position_ids)}, inference_logprobs: {len(inference_logprobs)}, temperatures: {len(temperatures)}"
+        f"input_ids: {len(input_ids)}, advantages: {len(advantages)}, loss_mask: {len(loss_mask)}, position_ids: {len(position_ids)}, inference_logprobs: {len(inference_logprobs)}, generated_mask: {len(generated_mask)}, temperatures: {len(temperatures)}"
     )
     if teacher_logprobs is not None:
         assert len(teacher_logprobs) == len(input_ids), f"teacher_logprobs: {len(teacher_logprobs)}"
@@ -52,6 +56,8 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
         position_ids=position_ids,
         inference_logprobs=inference_logprobs,
         teacher_logprobs=teacher_logprobs,
+        teacher_prompt_ids=teacher_prompt_ids,
+        generated_mask=generated_mask,
         temperatures=temperatures,
         # Multimodal fields (Qwen3-VL) - passed through without modification
         pixel_values=training_example.pixel_values,
@@ -100,11 +106,22 @@ def packed_samples_into_micro_bs(
                 bin_content.loss_mask.extend(sample.loss_mask)
                 bin_content.advantages.extend(sample.advantages)
                 bin_content.inference_logprobs.extend(sample.inference_logprobs)
+                if sample.generated_mask is not None:
+                    if bin_content.generated_mask is None:
+                        bin_content.generated_mask = []
+                    bin_content.generated_mask.extend(sample.generated_mask)
                 bin_content.temperatures.extend(sample.temperatures)
                 if sample.teacher_logprobs is not None:
                     if bin_content.teacher_logprobs is None:
                         bin_content.teacher_logprobs = []
                     bin_content.teacher_logprobs.extend(sample.teacher_logprobs)
+                if sample.teacher_prompt_ids is not None:
+                    if bin_content.teacher_prompt_ids is None:
+                        bin_content.teacher_prompt_ids = []
+                    assert len(sample.teacher_prompt_ids) == 1, (
+                        f"Expected one teacher prompt per unpacked sample, got {len(sample.teacher_prompt_ids)}"
+                    )
+                    bin_content.teacher_prompt_ids.append(sample.teacher_prompt_ids[0])
                 bin_content.position_ids.extend(sample.position_ids)
                 bin_content.lora_num_tokens[idx] += len(sample.input_ids)
                 break
@@ -137,6 +154,8 @@ def pad_micro_batch(micro_batch: MicroBatch, pad_to_multiple_of: int) -> MicroBa
     micro_batch.loss_mask.extend([False] * padding_size)
     micro_batch.position_ids.extend(list(range(padding_size)))
     micro_batch.inference_logprobs.extend([0.0] * padding_size)
+    if micro_batch.generated_mask is not None:
+        micro_batch.generated_mask.extend([False] * padding_size)
     # Use temperature 1.0 for padding tokens (doesn't matter since loss_mask is False)
     micro_batch.temperatures.extend([1.0] * padding_size)
     if micro_batch.teacher_logprobs is not None:
@@ -173,6 +192,8 @@ def prepare_batch(
         padded_batch = copy.deepcopy(micro_batches[0])
         padded_batch.advantages = [0.0] * len(padded_batch.input_ids)
         padded_batch.loss_mask = [False] * len(padded_batch.input_ids)
+        if padded_batch.generated_mask is not None:
+            padded_batch.generated_mask = [False] * len(padded_batch.input_ids)
         micro_batches.extend([padded_batch for _ in range(num_padding_batch)])
 
     assert len(micro_batches) % num_train_workers == 0, (

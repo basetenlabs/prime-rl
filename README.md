@@ -179,6 +179,8 @@ Check out the [docs](docs) directory for in-depth guides on how to use PRIME-RL.
 - [**Checkpointing**](docs/checkpointing.md) - Saving and resuming training from checkpoints
 - [**Benchmarking**](docs/benchmarking.md) - Performance benchmarking and throughput measurement
 - [**Deployment**](docs/deployment.md) - Training deployment on single-GPU, multi-GPU, and multi-node clusters
+- [**On-Policy Distillation**](docs/on_policy_distillation.md) - Self-distillation with EMA teacher and top-K tail KL divergence
+- [**Bring Your Own Algorithms**](docs/bring-your-own-algorithms.md) - Custom loss functions, advantage functions, and reward shaping
 - [**Troubleshooting**](docs/troubleshooting.md) - Common issues and their solutions
 
 ## Contributing

@@ -17,18 +17,22 @@ from prime_rl.trainer.ckpt import setup_ckpt_managers
 from prime_rl.trainer.multi_ckpt import setup_multi_checkpoint_manager
 from prime_rl.trainer.optim import setup_optimizer, setup_multi_optimizer
 from prime_rl.trainer.scheduler import setup_scheduler, setup_multi_scheduler
-from prime_rl.trainer.rl.config import LossConfig, RLTrainerConfig
-from prime_rl.trainer.rl.data import DataLoader, FakeDataLoader
+from prime_rl.trainer.rl.config import LossConfig, RLTrainerConfig, SelfDistillLossConfig
+from prime_rl.trainer.rl.data import DataLoader, FakeDataLoader, TensorMicroBatch
+from prime_rl.trainer.rl.ema import clone_params, copy_params_, ema_update_
 from prime_rl.utils.cp import (
     setup_cp_params,
     shard_for_cp,
 )
 from prime_rl.utils.logger import setup_logger
 from prime_rl.trainer.rl.loss import (
+    apply_prefix_generated_mask,
     compute_entropy,
     compute_loss,
+    compute_topk_tail_distill_loss,
     selective_log_softmax,
     setup_loss_fn,
+    shift_logits,
     shift_tensor_left,
     shift_tensor_right,
 )
@@ -60,6 +64,196 @@ from prime_rl.utils.pydantic_config import parse_argv
 from prime_rl.utils.utils import clean_exit, resolve_latest_ckpt_step, to_col_format
 from ring_flash_attn import substitute_hf_flash_attn
 from torchtitan.distributed.utils import clip_grad_norm_
+
+
+def _compute_self_distill_loss_scale(
+    micro_batches: list[TensorMicroBatch], loss_config: SelfDistillLossConfig
+) -> int:
+    total_distill_tokens = 0
+    for micro_batch in micro_batches:
+        loss_mask = micro_batch["loss_mask"]
+        generated_mask = micro_batch["generated_mask"]
+        effective_mask = apply_prefix_generated_mask(
+            loss_mask=loss_mask,
+            generated_mask=generated_mask,
+            loss_mask_prefix_tokens=loss_config.loss_mask_prefix_tokens,
+        )
+        total_distill_tokens += int(effective_mask.sum().item())
+    return max(total_distill_tokens, 1)
+
+
+def _compute_self_distill_microbatch_loss(
+    model: torch.nn.Module,
+    config: RLTrainerConfig,
+    loss_config: SelfDistillLossConfig,
+    run_idx: int,
+    step: int,
+    micro_step: int,
+    input_ids: torch.Tensor,
+    position_ids: torch.Tensor,
+    loss_mask: torch.Tensor,
+    generated_mask: torch.Tensor,
+    teacher_prompt_ids: list[list[int]] | None,
+    loss_scale: int,
+    ema_state: list[torch.Tensor],
+    maybe_record_function,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
+    response_lengths = get_response_lengths(position_ids)
+    split_input_ids = input_ids.squeeze(0).split(response_lengths)
+    split_loss_mask = loss_mask.squeeze(0).split(response_lengths)
+    split_generated_mask = generated_mask.squeeze(0).split(response_lengths)
+
+    if teacher_prompt_ids is None:
+        raise RuntimeError(
+            f"Self-distill teacher prompts are missing at run_idx={run_idx}, step={step}, micro_step={micro_step}. "
+            "Expected teacher_prompt_ids to be present in every micro batch."
+        )
+    if len(teacher_prompt_ids) != len(response_lengths):
+        raise RuntimeError(
+            f"Self-distill teacher prompt count mismatch at run_idx={run_idx}, step={step}, micro_step={micro_step}: "
+            f"prompts={len(teacher_prompt_ids)} sequences={len(response_lengths)}"
+        )
+
+    effective_masks = [
+        apply_prefix_generated_mask(
+            loss_mask=seq_loss_mask.unsqueeze(0),
+            generated_mask=seq_generated_mask.unsqueeze(0),
+            loss_mask_prefix_tokens=loss_config.loss_mask_prefix_tokens,
+        ).squeeze(0)
+        for seq_loss_mask, seq_generated_mask in zip(split_loss_mask, split_generated_mask)
+    ]
+
+    teacher_selected_logits: list[torch.Tensor | None] = [None] * len(split_input_ids)
+
+    # Pack all teacher sequences into a single forward call. The previous per-sequence
+    # loop called forward() a data-dependent number of times (skipping masked sequences),
+    # which caused FSDP ranks to issue different numbers of allgather collectives and deadlock.
+    teacher_sequences: list[torch.Tensor] = []
+    teacher_pos_ids_list: list[torch.Tensor] = []
+    teacher_seq_lengths: list[int] = []
+    teacher_prompt_lengths: list[int] = []
+
+    for seq_idx, (seq_input_ids, seq_teacher_prompt_ids) in enumerate(
+        zip(split_input_ids, teacher_prompt_ids)
+    ):
+        teacher_prompt = torch.tensor(seq_teacher_prompt_ids, dtype=torch.long, device=input_ids.device)
+        teacher_input = torch.cat([teacher_prompt, seq_input_ids], dim=0)
+        if teacher_input.numel() > config.model.seq_len:
+            logger.warning(
+                "Skipping self-distill teacher sequence that exceeds seq_len: "
+                f"run_idx={run_idx}, step={step}, micro_step={micro_step}, sequence_index={seq_idx}, "
+                f"teacher_prompt_tokens={teacher_prompt.numel()}, continuation_tokens={seq_input_ids.numel()}, "
+                f"total_teacher_tokens={teacher_input.numel()}, model_seq_len={config.model.seq_len}"
+            )
+            continue
+        teacher_sequences.append(teacher_input)
+        teacher_pos_ids_list.append(torch.arange(teacher_input.numel(), device=input_ids.device, dtype=torch.long))
+        teacher_seq_lengths.append(teacher_input.numel())
+        teacher_prompt_lengths.append(teacher_prompt.numel())
+
+    packed_teacher_ids = torch.cat(teacher_sequences, dim=0).unsqueeze(0)
+    packed_teacher_pos = torch.cat(teacher_pos_ids_list, dim=0).unsqueeze(0)
+
+    model_params = list(model.parameters())
+    student_param_snapshot = clone_params(model_params)
+    copy_params_(model_params, ema_state)
+    try:
+        with torch.no_grad():
+            with maybe_record_function("teacher_forward"), maybe_activation_offloading(config.model.ac_offloading):
+                teacher_out = forward(
+                    model,
+                    packed_teacher_ids,
+                    packed_teacher_pos,
+                    labels=None,
+                    temperature=None,
+                )
+            teacher_logits = teacher_out.get("logits")
+            if teacher_logits is None:
+                raise RuntimeError(
+                    "Teacher forward did not return logits in self-distill mode. "
+                    "Ensure fused LM head is disabled."
+                )
+
+            teacher_aligned_logits = shift_logits(teacher_logits).squeeze(0)
+            split_teacher_logits = teacher_aligned_logits.split(teacher_seq_lengths, dim=0)
+
+            for seq_idx, (seq_input_ids, seq_effective_mask, seq_teacher_logits, prompt_len) in enumerate(
+                zip(split_input_ids, effective_masks, split_teacher_logits, teacher_prompt_lengths)
+            ):
+                if not seq_effective_mask.any():
+                    continue
+                continuation_logits = seq_teacher_logits[prompt_len:]
+                if continuation_logits.shape[0] != seq_input_ids.numel():
+                    raise RuntimeError(
+                        "Failed to align teacher logits to continuation tokens: "
+                        f"run_idx={run_idx}, step={step}, micro_step={micro_step}, sequence_index={seq_idx}, "
+                        f"continuation_tokens={seq_input_ids.numel()}, aligned_teacher_tokens={continuation_logits.shape[0]}"
+                    )
+                teacher_selected_logits[seq_idx] = continuation_logits[seq_effective_mask].detach()
+    finally:
+        copy_params_(model_params, student_param_snapshot)
+
+    with maybe_record_function("forward"), maybe_activation_offloading(config.model.ac_offloading):
+        student_out = forward(
+            model,
+            input_ids,
+            position_ids,
+            labels=None,
+            temperature=None,
+        )
+    student_logits = student_out.get("logits")
+    if student_logits is None:
+        raise RuntimeError("Self-distill mode requires full logits; set model.fused_lm_head_chunk_size='disabled'.")
+
+    student_aligned_logits = shift_logits(student_logits)
+    student_logprobs = selective_log_softmax(student_aligned_logits, input_ids)
+    student_entropy = compute_entropy(student_aligned_logits)
+
+    split_student_logits = student_aligned_logits.squeeze(0).split(response_lengths, dim=0)
+
+    distill_token_losses: list[torch.Tensor] = []
+    total_distill_loss = torch.zeros((), device=input_ids.device, dtype=torch.float32)
+    for seq_idx, (student_seq_logits, seq_effective_mask, teacher_seq_logits) in enumerate(
+        zip(split_student_logits, effective_masks, teacher_selected_logits)
+    ):
+        if teacher_seq_logits is None:
+            continue
+        student_selected_logits = student_seq_logits[seq_effective_mask]
+        if student_selected_logits.shape[0] != teacher_seq_logits.shape[0]:
+            raise RuntimeError(
+                "Teacher/student selected token count mismatch in self-distill mode: "
+                f"run_idx={run_idx}, step={step}, micro_step={micro_step}, sequence_index={seq_idx}, "
+                f"student_tokens={student_selected_logits.shape[0]}, teacher_tokens={teacher_seq_logits.shape[0]}"
+            )
+
+        seq_token_losses = compute_topk_tail_distill_loss(
+            student_logits=student_selected_logits.unsqueeze(0),
+            teacher_logits=teacher_seq_logits.unsqueeze(0),
+            top_k=loss_config.top_k,
+            divergence=loss_config.divergence,
+            symmetric_mix=loss_config.symmetric_mix,
+        ).squeeze(0)
+        distill_token_losses.append(seq_token_losses)
+        total_distill_loss = total_distill_loss + seq_token_losses.sum()
+
+    if distill_token_losses:
+        distill_kl = torch.cat(distill_token_losses, dim=0)
+    else:
+        distill_kl = torch.zeros(0, device=input_ids.device, dtype=torch.float32)
+        # When no tokens survive the effective mask, total_distill_loss is a plain zero with no
+        # grad_fn. Backward on a detached scalar crashes, and — worse — the missing FSDP allgather
+        # collectives deadlock every other rank. Multiplying by 0.0 through the student logits
+        # keeps the tensor on the computation graph so backward issues the same collectives as
+        # every other rank while contributing zero gradient.
+        total_distill_loss = total_distill_loss + 0.0 * student_aligned_logits.sum()
+    distill_tokens = torch.tensor([float(distill_kl.numel())], device=input_ids.device, dtype=torch.float32)
+
+    scaled_loss = total_distill_loss / loss_scale
+    loss_metrics = {
+        "distill_kl": distill_kl,
+        "distill_tokens": distill_tokens,
+    }
+    return scaled_loss, loss_metrics, student_logprobs, student_entropy
 
 
 @clean_exit
@@ -142,7 +336,11 @@ def train(config: RLTrainerConfig):
 
     # Set up the loss function
     logger.info(f"Setting up loss function ({config.loss})")
-    loss_fn = setup_loss_fn(config.loss)
+    is_self_distill = isinstance(config.loss, SelfDistillLossConfig)
+    if is_self_distill:
+        loss_fn = None
+    else:
+        loss_fn = setup_loss_fn(config.loss)
 
     # Set up the optimizer
     logger.info(f"Initializing optimizer ({config.optim})")
@@ -185,6 +383,30 @@ def train(config: RLTrainerConfig):
     if checkpoint_step is not None:
         ckpt_manager.load(checkpoint_step, model, [optimizer], scheduler, progress)
         logger.info(f"Resuming training from checkpoint step {checkpoint_step}")
+
+    ema_state: list[torch.Tensor] | None = None
+    if is_self_distill:
+        model_params = list(model.parameters())
+        ema_state = clone_params(model_params)
+        if checkpoint_step is not None and ckpt_manager is not None:
+            ema_from_checkpoint = ckpt_manager.load_ema(checkpoint_step, map_location=model_params[0].device)
+            if ema_from_checkpoint is None:
+                logger.warning(
+                    f"No EMA checkpoint state found at step {checkpoint_step}; initializing EMA teacher from student weights."
+                )
+            else:
+                if len(ema_from_checkpoint) != len(model_params):
+                    raise RuntimeError(
+                        f"EMA checkpoint parameter count mismatch: ckpt={len(ema_from_checkpoint)} model={len(model_params)}"
+                    )
+                ema_state = []
+                for model_param, ema_param in zip(model_params, ema_from_checkpoint):
+                    if model_param.shape != ema_param.shape:
+                        raise RuntimeError(
+                            f"EMA checkpoint parameter shape mismatch: ckpt={ema_param.shape} model={model_param.shape}"
+                        )
+                    ema_state.append(ema_param.to(device=model_param.device, dtype=model_param.dtype))
+                logger.info(f"Loaded EMA checkpoint state from step {checkpoint_step}")
 
     logger.info(
         f"Starting from step {progress.step} (total_tokens={progress.total_tokens}, total_samples={progress.total_samples})"
@@ -245,6 +467,8 @@ def train(config: RLTrainerConfig):
             logger.info(f"Saving checkpoint at step {progress.step}")
             save_ckpt_start_time = time.perf_counter()
             ckpt_manager.save(progress.step, model, [optimizer], scheduler, progress)
+            if is_self_distill and ema_state is not None:
+                ckpt_manager.save_ema(progress.step, ema_state)
             save_ckpt_time = time.perf_counter() - save_ckpt_start_time
 
             # Maybe clean up old checkpoints
@@ -296,7 +520,10 @@ def train(config: RLTrainerConfig):
         seq_len = micro_batches[0]["input_ids"].shape[1]
 
         # Normalize by the local number of unmasked tokens in the batch (per-batch length normalization)
-        if isinstance(config.loss, LossConfig) and config.loss.ratio_type == "token":
+        if is_self_distill:
+            assert isinstance(config.loss, SelfDistillLossConfig)
+            loss_scale = _compute_self_distill_loss_scale(micro_batches, config.loss)
+        elif isinstance(config.loss, LossConfig) and config.loss.ratio_type == "token":
             loss_scale = sum(micro_batch["loss_mask"].sum().item() for micro_batch in micro_batches)
         else:
             loss_scale = batch_size
@@ -308,16 +535,23 @@ def train(config: RLTrainerConfig):
         cp_rank = parallel_dims.world_mesh["cp"].get_local_rank() if cp_enabled else 0
         cp_group = parallel_dims.world_mesh["cp"].get_group() if cp_enabled else None
         cp_size = parallel_dims.cp
+        if is_self_distill and cp_enabled:
+            raise NotImplementedError("Self-distill mode does not support context parallelism in v1.")
 
         for micro_step, micro_batch in enumerate(micro_batches):
             input_ids = micro_batch["input_ids"].to("cuda")
             position_ids = micro_batch["position_ids"].to("cuda")
             advantages = micro_batch["advantages"].to("cuda")
             loss_mask = micro_batch["loss_mask"].to("cuda")
+            generated_mask = micro_batch["generated_mask"].to("cuda")
             inference_logprobs = micro_batch["inference_logprobs"].to("cuda")
             teacher_logprobs = (
                 micro_batch["teacher_logprobs"].to("cuda") if micro_batch["teacher_logprobs"] is not None else None
             )
+            teacher_prompt_ids = micro_batch.get("teacher_prompt_ids")
+            run_token_counts = micro_batch["lora_num_tokens"]
+            nonzero_run_idxs = torch.nonzero(run_token_counts > 0, as_tuple=False).flatten()
+            run_idx = int(nonzero_run_idxs[0].item()) if nonzero_run_idxs.numel() > 0 else -1
 
             # Multimodal fields (Qwen3-VL) - only present for VLM training
             pixel_values = (
@@ -326,6 +560,8 @@ def train(config: RLTrainerConfig):
             image_grid_thw = (
                 micro_batch["image_grid_thw"].to("cuda") if micro_batch.get("image_grid_thw") is not None else None
             )
+            if is_self_distill and pixel_values is not None:
+                raise NotImplementedError("Self-distill mode does not support VLM/multimodal training in v1.")
 
             labels = shift_tensor_left(input_ids)
 
@@ -358,67 +594,90 @@ def train(config: RLTrainerConfig):
             if cp_enabled:
                 temperatures = shard_for_cp(temperatures, cp_rank=cp_rank, cp_world_size=cp_size)
 
-            # Forward pass with per-token temperatures
-            with maybe_record_function("forward"), maybe_activation_offloading(config.model.ac_offloading):
-                out = forward(
-                    model,
-                    input_ids,
-                    forward_position_ids,
-                    labels=labels,
-                    temperature=temperatures,
-                    pixel_values=pixel_values,
-                    image_grid_thw=image_grid_thw,
+            if is_self_distill:
+                assert isinstance(config.loss, SelfDistillLossConfig)
+                assert ema_state is not None
+                loss, loss_tensors, trainer_logprobs_for_logging, entropy_for_logging = _compute_self_distill_microbatch_loss(
+                    model=model,
+                    config=config,
+                    loss_config=config.loss,
+                    run_idx=run_idx,
+                    step=progress.step,
+                    micro_step=micro_step,
+                    input_ids=input_ids,
+                    position_ids=forward_position_ids,
+                    loss_mask=loss_mask,
+                    generated_mask=generated_mask,
+                    teacher_prompt_ids=teacher_prompt_ids,
+                    loss_scale=loss_scale,
+                    ema_state=ema_state,
+                    maybe_record_function=maybe_record_function,
+                )
+            else:
+                # Forward pass with per-token temperatures
+                with maybe_record_function("forward"), maybe_activation_offloading(config.model.ac_offloading):
+                    out = forward(
+                        model,
+                        input_ids,
+                        forward_position_ids,
+                        labels=labels,
+                        temperature=temperatures,
+                        pixel_values=pixel_values,
+                        image_grid_thw=image_grid_thw,
+                    )
+
+                if out.get("logprobs") is None:
+                    # VanillaOutputLinear was used - need to compute logprobs externally with per-token temps
+                    assert out.get("logits") is not None, "Logits must be provided to compute logprobs"
+                    logits = out["logits"]
+                    # Per-token temperature scaling: temperatures is [batch, seq], logits is [batch, seq, vocab]
+                    scaled_logits = logits / temperatures.unsqueeze(-1)
+                    out["logprobs"] = selective_log_softmax(scaled_logits, labels)
+                    out["entropy"] = compute_entropy(scaled_logits)
+                # else: FusedOutputLinear was used - logprobs already computed with per-token temperatures
+
+                if cp_enabled:
+                    logprobs = dist_nn.all_gather(out["logprobs"], group=cp_group)
+                    out["logprobs"] = torch.cat(logprobs, dim=1)
+
+                    entropies = [torch.zeros_like(out["entropy"]) for _ in range(cp_size)]
+                    dist.all_gather(entropies, out["entropy"], group=cp_group)
+                    out["entropy"] = torch.cat(entropies, dim=1)
+
+                vocab_size = getattr(model.config, "vocab_size", None) or model.config.text_config.vocab_size
+                # This is not really necessary as the first token should be masked out, but we do it anyway to be sure
+                out["logprobs"] = shift_tensor_right(
+                    out["logprobs"], pad_value=torch.log(torch.tensor(1.0 / vocab_size)).item()
+                )
+                out["entropy"] = shift_tensor_right(
+                    out["entropy"], pad_value=torch.log(torch.tensor(float(vocab_size))).item()
                 )
 
-            if out.get("logprobs") is None:
-                # VanillaOutputLinear was used - need to compute logprobs externally with per-token temps
-                assert out.get("logits") is not None, "Logits must be provided to compute logprobs"
-                logits = out["logits"]
-                # Per-token temperature scaling: temperatures is [batch, seq], logits is [batch, seq, vocab]
-                scaled_logits = logits / temperatures.unsqueeze(-1)
-                out["logprobs"] = selective_log_softmax(scaled_logits, labels)
-                out["entropy"] = compute_entropy(scaled_logits)
-            # else: FusedOutputLinear was used - logprobs already computed with per-token temperatures
-
-            if cp_enabled:
-                logprobs = dist_nn.all_gather(out["logprobs"], group=cp_group)
-                out["logprobs"] = torch.cat(logprobs, dim=1)
-
-                entropies = [torch.zeros_like(out["entropy"]) for _ in range(cp_size)]
-                dist.all_gather(entropies, out["entropy"], group=cp_group)
-                out["entropy"] = torch.cat(entropies, dim=1)
-
-            vocab_size = getattr(model.config, "vocab_size", None) or model.config.text_config.vocab_size
-            # This is not really necessary as the first token should be masked out, but we do it anyway to be sure
-            out["logprobs"] = shift_tensor_right(
-                out["logprobs"], pad_value=torch.log(torch.tensor(1.0 / vocab_size)).item()
-            )
-            out["entropy"] = shift_tensor_right(
-                out["entropy"], pad_value=torch.log(torch.tensor(float(vocab_size))).item()
-            )
-
-            # Compute loss
-            response_lengths = get_response_lengths(position_ids)
-            loss, loss_tensors = compute_loss(
-                trainer_logprobs=out["logprobs"].squeeze().split(response_lengths),
-                inference_logprobs=inference_logprobs.squeeze().split(response_lengths),
-                teacher_logprobs=teacher_logprobs.squeeze().split(response_lengths)
-                if teacher_logprobs is not None
-                else None,
-                advantages=advantages.squeeze().split(response_lengths),
-                loss_mask=loss_mask.squeeze().split(response_lengths),
-                loss_fn=loss_fn,
-                loss_scale=loss_scale,
-            )
+                # Compute loss
+                response_lengths = get_response_lengths(position_ids)
+                assert loss_fn is not None
+                loss, loss_tensors = compute_loss(
+                    trainer_logprobs=out["logprobs"].squeeze().split(response_lengths),
+                    inference_logprobs=inference_logprobs.squeeze().split(response_lengths),
+                    teacher_logprobs=teacher_logprobs.squeeze().split(response_lengths)
+                    if teacher_logprobs is not None
+                    else None,
+                    advantages=advantages.squeeze().split(response_lengths),
+                    loss_mask=loss_mask.squeeze().split(response_lengths),
+                    loss_fn=loss_fn,
+                    loss_scale=loss_scale,
+                )
+                trainer_logprobs_for_logging = out["logprobs"]
+                entropy_for_logging = out["entropy"]
 
             # Backward pass
             with maybe_record_function("backward"):
                 loss.backward()
 
             # Add relevant tensors to tensor dict for logging purposes
-            tensors["trainer_probs"].append(torch.exp(out["logprobs"])[loss_mask].detach().to("cpu"))
+            tensors["trainer_probs"].append(torch.exp(trainer_logprobs_for_logging)[loss_mask].detach().to("cpu"))
             tensors["inference_probs"].append(torch.exp(inference_logprobs)[loss_mask].detach().to("cpu"))
-            tensors["entropy"].append(out["entropy"][loss_mask].detach().to("cpu"))
+            tensors["entropy"].append(entropy_for_logging[loss_mask].detach().to("cpu"))
             tensors["loss"].append(loss.detach().to("cpu").unsqueeze(0))
 
             if is_tt_moe_model(model):
@@ -450,6 +709,10 @@ def train(config: RLTrainerConfig):
 
         # Update the model parameters
         optimizer.step()
+        if is_self_distill:
+            assert isinstance(config.loss, SelfDistillLossConfig)
+            assert ema_state is not None
+            ema_update_(teacher_params=ema_state, student_params=model.parameters(), alpha=config.loss.ema_alpha)
         optimizer.zero_grad()
 
         # Update learning rate scheduler
@@ -586,6 +849,8 @@ def train(config: RLTrainerConfig):
     if config.max_concurrent_runs == 1 and ckpt_manager is not None:
         logger.info("Writing final checkpoint")
         ckpt_manager.save(progress.step, model, [optimizer], scheduler, progress)
+        if is_self_distill and ema_state is not None:
+            ckpt_manager.save_ema(progress.step, ema_state)
         ckpt_manager.maybe_clean()
 
     if config.max_concurrent_runs == 1 and weight_ckpt_manager is not None:

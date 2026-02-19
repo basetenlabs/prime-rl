@@ -153,6 +153,8 @@ class MultiPacker(BasePacker):
                 False,
                 f"Run wrote a sample with teacher logprobs length != sample length ({len(sample.teacher_logprobs)} != {sample_length})",
             )
+        if sample.teacher_prompt_ids is not None and len(sample.teacher_prompt_ids) == 0:
+            return (False, "Run wrote a sample with empty teacher_prompt_ids")
         return True, None
 
     def _get_batch(self) -> None:

@@ -104,6 +104,81 @@ def _safe_mean(values: Tensor, mask: Tensor) -> Tensor:
     return values[mask].sum() / denom
 
 
+def apply_prefix_generated_mask(
+    loss_mask: Bool[Tensor, "batch seq"],
+    generated_mask: Bool[Tensor, "batch seq"],
+    loss_mask_prefix_tokens: int,
+) -> Bool[Tensor, "batch seq"]:
+    if loss_mask_prefix_tokens <= 0:
+        return loss_mask
+    if loss_mask.shape != generated_mask.shape:
+        raise ValueError(f"Shape mismatch: loss_mask={loss_mask.shape} generated_mask={generated_mask.shape}")
+
+    generated_positions = generated_mask.to(dtype=torch.int64).cumsum(dim=-1)
+    prefix_generated_mask = generated_mask & (generated_positions <= loss_mask_prefix_tokens)
+    return loss_mask & ~prefix_generated_mask
+
+
+def compute_topk_tail_distill_loss(
+    student_logits: Float[Tensor, "batch seq vocab"],
+    teacher_logits: Float[Tensor, "batch seq vocab"],
+    top_k: int,
+    divergence: str,
+    symmetric_mix: float = 0.5,
+    eps: float = 1e-8,
+) -> Float[Tensor, "batch seq"]:
+    if student_logits.shape != teacher_logits.shape:
+        raise ValueError(
+            f"Shape mismatch for distillation logits: student={student_logits.shape}, teacher={teacher_logits.shape}"
+        )
+    if top_k < 1:
+        raise ValueError(f"top_k must be >= 1, got {top_k}")
+
+    # .clamp_min(eps) replaces every element of x that is smaller than eps with eps
+    # mathematically equivalent to x = max(x, eps) or alternatively x = torch.where(x < eps, eps, x)
+    # TO-DO: I couldn't find it in the docs, so maybe the correct use is x = torch.clamp(x, min=eps)
+
+    # converts logits to probabilities over softmax
+    # float() improves numerical stability beforre softmax/log ops
+    # need to use clamp_min() to avoid exact zeros, because we later take logs
+    student_probs = torch.softmax(student_logits.float(), dim=-1).clamp_min(eps)
+    teacher_probs = torch.softmax(teacher_logits.float(), dim=-1).clamp_min(eps)
+
+    # If caller asks for K bigger than vocab size, clamp it to vocab size
+    top_k = min(top_k, student_probs.shape[-1])
+    # Selects indices of top-K from the student distribution only
+    topk_indices = torch.topk(student_probs, k=top_k, dim=-1).indices
+    # Extracts student probabilities at the same student-chosen indices
+    student_topk = torch.gather(student_probs, dim=-1, index=topk_indices).clamp_min(eps)
+    # Extracts teacher probabilities at the same student-chosen indices
+    teacher_topk = torch.gather(teacher_probs, dim=-1, index=topk_indices).clamp_min(eps)
+
+    # Summing over dim=-1 sums over the vocab, so we get a tensor of shape (batch, seq) where each element is the probability mass of the top-K tokens
+    student_topk_mass = student_topk.sum(dim=-1).clamp_min(eps)
+    teacher_topk_mass = teacher_topk.sum(dim=-1).clamp_min(eps)
+    # The tail is simply the probability mass of tokens not in the top-K
+    student_tail_mass = (1.0 - student_topk_mass).clamp_min(eps)
+    teacher_tail_mass = (1.0 - teacher_topk_mass).clamp_min(eps)
+
+    # coarse-grained forward KL
+    forward_kl = (teacher_topk * (teacher_topk.log() - student_topk.log())).sum(dim=-1) + teacher_tail_mass * (
+        teacher_tail_mass.log() - student_tail_mass.log()
+    )
+    # coarse-grained reverse KL
+    reverse_kl = (student_topk * (student_topk.log() - teacher_topk.log())).sum(dim=-1) + student_tail_mass * (
+        student_tail_mass.log() - teacher_tail_mass.log()
+    )
+
+    if divergence == "forward_kl":
+        return forward_kl
+    if divergence == "reverse_kl":
+        return reverse_kl
+    if divergence == "symmetric":
+        # Convex combination of forward and reverse KL divergences
+        return symmetric_mix * forward_kl + (1.0 - symmetric_mix) * reverse_kl
+    raise ValueError(f"Unsupported divergence: {divergence}")
+
+
 def default_loss_fn(inputs: LossInputs, loss_config: LossConfig) -> LossOutputs:
     """Masked importance sampling with KL against the inference policy, and optional masking strategies."""
     trainer_logprobs = inputs.trainer_logprobs
@@ -183,6 +258,9 @@ def setup_loss_fn(loss_config: LossConfigType) -> LossFn:
             return custom_fn(inputs, **kwargs)
 
         return loss_fn
+
+    if not isinstance(loss_config, LossConfig):
+        raise ValueError(f"Loss mode {type(loss_config).__name__} does not use setup_loss_fn")
 
     def loss_fn(inputs: LossInputs) -> LossOutputs:
         return default_loss_fn(inputs, loss_config)

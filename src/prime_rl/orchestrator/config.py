@@ -616,6 +616,20 @@ class OrchestratorConfig(BaseSettings):
         ),
     ] = None
 
+    self_distill: Annotated[
+        bool,
+        Field(
+            description="Whether to attach demonstration-conditioned teacher prompts to training samples."
+        ),
+    ] = False
+
+    self_distill_suffix: Annotated[
+        str,
+        Field(
+            description="Suffix appended after the demonstration in the teacher prompt."
+        ),
+    ] = "Now answer with a response of your own, including the thinking process:"
+
     # The sampling configuration
     sampling: SamplingConfig = SamplingConfig()
 
