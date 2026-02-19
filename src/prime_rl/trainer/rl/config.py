@@ -1,7 +1,7 @@
 from pathlib import Path
 from typing import Annotated, Any, Literal, TypeAlias
 
-from pydantic import BaseModel, Discriminator, Field, Tag, model_validator
+from pydantic import BaseModel, ConfigDict, Discriminator, Field, Tag, model_validator
 
 from prime_rl.trainer.config import (
     AdamWConfig,
@@ -83,6 +83,10 @@ class CustomLossConfig(BaseModel):
 
 class SelfDistillLossConfig(BaseConfig):
     """Config for demonstration-conditioned on-policy self-distillation."""
+
+    # Allow extra fields because pydantic-settings' nested_model_default_partial_update
+    # merges LossConfig defaults when switching discriminated union variant via TOML.
+    model_config = ConfigDict(extra="ignore")
 
     type: Literal["self_distill"] = "self_distill"
     divergence: Annotated[

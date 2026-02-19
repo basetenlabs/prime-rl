@@ -24,6 +24,25 @@ def test_build_teacher_prompt_renders_transcript_and_demonstration():
     assert "<Demonstration>\nA2\n" in prompt
 
 
+def test_build_teacher_prompt_with_system_message():
+    dataset = [
+        {
+            "example_id": 11,
+            "messages": [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "What is 2+2?"},
+                {"role": "assistant", "content": "4"},
+            ],
+        }
+    ]
+    lookup = build_example_lookup(dataset)
+    prompt = build_teacher_prompt(lookup, 11)
+
+    assert "<SYSTEM>\nYou are a helpful assistant.\n</SYSTEM>" in prompt
+    assert "<USER>\nWhat is 2+2?\n</USER>" in prompt
+    assert "<Demonstration>\n4\n" in prompt
+
+
 def test_build_teacher_prompt_rejects_non_text_content():
     dataset = [
         {

@@ -124,61 +124,74 @@ def _compute_self_distill_microbatch_loss(
     ]
 
     teacher_selected_logits: list[torch.Tensor | None] = [None] * len(split_input_ids)
-    needs_teacher_forward = any(mask.any() for mask in effective_masks)
 
-    if needs_teacher_forward:
-        model_params = list(model.parameters())
-        student_param_snapshot = clone_params(model_params)
-        copy_params_(model_params, ema_state)
-        try:
-            with torch.no_grad():
-                for seq_idx, (seq_input_ids, seq_effective_mask, seq_teacher_prompt_ids) in enumerate(
-                    zip(split_input_ids, effective_masks, teacher_prompt_ids)
-                ):
-                    if not seq_effective_mask.any():
-                        continue
+    # Pack all teacher sequences into a single forward call. The previous per-sequence
+    # loop called forward() a data-dependent number of times (skipping masked sequences),
+    # which caused FSDP ranks to issue different numbers of allgather collectives and deadlock.
+    teacher_sequences: list[torch.Tensor] = []
+    teacher_pos_ids_list: list[torch.Tensor] = []
+    teacher_seq_lengths: list[int] = []
+    teacher_prompt_lengths: list[int] = []
 
-                    teacher_prompt = torch.tensor(seq_teacher_prompt_ids, dtype=torch.long, device=input_ids.device)
-                    teacher_input_ids = torch.cat([teacher_prompt, seq_input_ids], dim=0)
-                    if teacher_input_ids.numel() > config.model.seq_len:
-                        raise RuntimeError(
-                            "Self-distill teacher input exceeds configured sequence length: "
-                            f"run_idx={run_idx}, step={step}, micro_step={micro_step}, sequence_index={seq_idx}, "
-                            f"teacher_prompt_tokens={teacher_prompt.numel()}, continuation_tokens={seq_input_ids.numel()}, "
-                            f"total_teacher_tokens={teacher_input_ids.numel()}, model_seq_len={config.model.seq_len}"
-                        )
+    for seq_idx, (seq_input_ids, seq_teacher_prompt_ids) in enumerate(
+        zip(split_input_ids, teacher_prompt_ids)
+    ):
+        teacher_prompt = torch.tensor(seq_teacher_prompt_ids, dtype=torch.long, device=input_ids.device)
+        teacher_input = torch.cat([teacher_prompt, seq_input_ids], dim=0)
+        if teacher_input.numel() > config.model.seq_len:
+            logger.warning(
+                "Skipping self-distill teacher sequence that exceeds seq_len: "
+                f"run_idx={run_idx}, step={step}, micro_step={micro_step}, sequence_index={seq_idx}, "
+                f"teacher_prompt_tokens={teacher_prompt.numel()}, continuation_tokens={seq_input_ids.numel()}, "
+                f"total_teacher_tokens={teacher_input.numel()}, model_seq_len={config.model.seq_len}"
+            )
+            continue
+        teacher_sequences.append(teacher_input)
+        teacher_pos_ids_list.append(torch.arange(teacher_input.numel(), device=input_ids.device, dtype=torch.long))
+        teacher_seq_lengths.append(teacher_input.numel())
+        teacher_prompt_lengths.append(teacher_prompt.numel())
 
-                    teacher_position_ids = torch.arange(
-                        teacher_input_ids.numel(), device=input_ids.device, dtype=torch.long
-                    ).unsqueeze(0)
-                    with maybe_record_function("teacher_forward"), maybe_activation_offloading(config.model.ac_offloading):
-                        teacher_out = forward(
-                            model,
-                            teacher_input_ids.unsqueeze(0),
-                            teacher_position_ids,
-                            labels=None,
-                            temperature=None,
-                        )
-                    teacher_logits = teacher_out.get("logits")
-                    if teacher_logits is None:
-                        raise RuntimeError(
-                            "Teacher forward did not return logits in self-distill mode. "
-                            "Ensure fused LM head is disabled."
-                        )
+    packed_teacher_ids = torch.cat(teacher_sequences, dim=0).unsqueeze(0)
+    packed_teacher_pos = torch.cat(teacher_pos_ids_list, dim=0).unsqueeze(0)
 
-                    teacher_aligned_logits = shift_logits(teacher_logits).squeeze(0)
-                    continuation_start = teacher_prompt.numel()
-                    continuation_end = continuation_start + seq_input_ids.numel()
-                    continuation_logits = teacher_aligned_logits[continuation_start:continuation_end]
-                    if continuation_logits.shape[0] != seq_input_ids.numel():
-                        raise RuntimeError(
-                            "Failed to align teacher logits to continuation tokens: "
-                            f"run_idx={run_idx}, step={step}, micro_step={micro_step}, sequence_index={seq_idx}, "
-                            f"continuation_tokens={seq_input_ids.numel()}, aligned_teacher_tokens={continuation_logits.shape[0]}"
-                        )
-                    teacher_selected_logits[seq_idx] = continuation_logits[seq_effective_mask].detach()
-        finally:
-            copy_params_(model_params, student_param_snapshot)
+    model_params = list(model.parameters())
+    student_param_snapshot = clone_params(model_params)
+    copy_params_(model_params, ema_state)
+    try:
+        with torch.no_grad():
+            with maybe_record_function("teacher_forward"), maybe_activation_offloading(config.model.ac_offloading):
+                teacher_out = forward(
+                    model,
+                    packed_teacher_ids,
+                    packed_teacher_pos,
+                    labels=None,
+                    temperature=None,
+                )
+            teacher_logits = teacher_out.get("logits")
+            if teacher_logits is None:
+                raise RuntimeError(
+                    "Teacher forward did not return logits in self-distill mode. "
+                    "Ensure fused LM head is disabled."
+                )
+
+            teacher_aligned_logits = shift_logits(teacher_logits).squeeze(0)
+            split_teacher_logits = teacher_aligned_logits.split(teacher_seq_lengths, dim=0)
+
+            for seq_idx, (seq_input_ids, seq_effective_mask, seq_teacher_logits, prompt_len) in enumerate(
+                zip(split_input_ids, effective_masks, split_teacher_logits, teacher_prompt_lengths)
+            ):
+                if not seq_effective_mask.any():
+                    continue
+                continuation_logits = seq_teacher_logits[prompt_len:]
+                if continuation_logits.shape[0] != seq_input_ids.numel():
+                    raise RuntimeError(
+                        "Failed to align teacher logits to continuation tokens: "
+                        f"run_idx={run_idx}, step={step}, micro_step={micro_step}, sequence_index={seq_idx}, "
+                        f"continuation_tokens={seq_input_ids.numel()}, aligned_teacher_tokens={continuation_logits.shape[0]}"
+                    )
+                teacher_selected_logits[seq_idx] = continuation_logits[seq_effective_mask].detach()
+    finally:
+        copy_params_(model_params, student_param_snapshot)
 
     with maybe_record_function("forward"), maybe_activation_offloading(config.model.ac_offloading):
         student_out = forward(
@@ -227,6 +240,12 @@ def _compute_self_distill_microbatch_loss(
         distill_kl = torch.cat(distill_token_losses, dim=0)
     else:
         distill_kl = torch.zeros(0, device=input_ids.device, dtype=torch.float32)
+        # When no tokens survive the effective mask, total_distill_loss is a plain zero with no
+        # grad_fn. Backward on a detached scalar crashes, and — worse — the missing FSDP allgather
+        # collectives deadlock every other rank. Multiplying by 0.0 through the student logits
+        # keeps the tensor on the computation graph so backward issues the same collectives as
+        # every other rank while contributing zero gradient.
+        total_distill_loss = total_distill_loss + 0.0 * student_aligned_logits.sum()
     distill_tokens = torch.tensor([float(distill_kl.numel())], device=input_ids.device, dtype=torch.float32)
 
     scaled_loss = total_distill_loss / loss_scale
