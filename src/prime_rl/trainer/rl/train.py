@@ -132,6 +132,7 @@ def _compute_self_distill_microbatch_loss(
     teacher_pos_ids_list: list[torch.Tensor] = []
     teacher_seq_lengths: list[int] = []
     teacher_prompt_lengths: list[int] = []
+    included_seq_indices: list[int] = []
 
     for seq_idx, (seq_input_ids, seq_teacher_prompt_ids) in enumerate(
         zip(split_input_ids, teacher_prompt_ids)
@@ -150,48 +151,58 @@ def _compute_self_distill_microbatch_loss(
         teacher_pos_ids_list.append(torch.arange(teacher_input.numel(), device=input_ids.device, dtype=torch.long))
         teacher_seq_lengths.append(teacher_input.numel())
         teacher_prompt_lengths.append(teacher_prompt.numel())
+        included_seq_indices.append(seq_idx)
 
-    packed_teacher_ids = torch.cat(teacher_sequences, dim=0).unsqueeze(0)
-    packed_teacher_pos = torch.cat(teacher_pos_ids_list, dim=0).unsqueeze(0)
+    if not teacher_sequences:
+        logger.warning(
+            "All teacher sequences in micro batch exceeded seq_len, skipping self-distill loss: "
+            f"run_idx={run_idx}, step={step}, micro_step={micro_step}"
+        )
+    else:
+        packed_teacher_ids = torch.cat(teacher_sequences, dim=0).unsqueeze(0)
+        packed_teacher_pos = torch.cat(teacher_pos_ids_list, dim=0).unsqueeze(0)
 
-    model_params = list(model.parameters())
-    student_param_snapshot = clone_params(model_params)
-    copy_params_(model_params, ema_state)
-    try:
-        with torch.no_grad():
-            with maybe_record_function("teacher_forward"), maybe_activation_offloading(config.model.ac_offloading):
-                teacher_out = forward(
-                    model,
-                    packed_teacher_ids,
-                    packed_teacher_pos,
-                    labels=None,
-                    temperature=None,
-                )
-            teacher_logits = teacher_out.get("logits")
-            if teacher_logits is None:
-                raise RuntimeError(
-                    "Teacher forward did not return logits in self-distill mode. "
-                    "Ensure fused LM head is disabled."
-                )
-
-            teacher_aligned_logits = shift_logits(teacher_logits).squeeze(0)
-            split_teacher_logits = teacher_aligned_logits.split(teacher_seq_lengths, dim=0)
-
-            for seq_idx, (seq_input_ids, seq_effective_mask, seq_teacher_logits, prompt_len) in enumerate(
-                zip(split_input_ids, effective_masks, split_teacher_logits, teacher_prompt_lengths)
-            ):
-                if not seq_effective_mask.any():
-                    continue
-                continuation_logits = seq_teacher_logits[prompt_len:]
-                if continuation_logits.shape[0] != seq_input_ids.numel():
-                    raise RuntimeError(
-                        "Failed to align teacher logits to continuation tokens: "
-                        f"run_idx={run_idx}, step={step}, micro_step={micro_step}, sequence_index={seq_idx}, "
-                        f"continuation_tokens={seq_input_ids.numel()}, aligned_teacher_tokens={continuation_logits.shape[0]}"
+        model_params = list(model.parameters())
+        student_param_snapshot = clone_params(model_params)
+        copy_params_(model_params, ema_state)
+        try:
+            with torch.no_grad():
+                with maybe_record_function("teacher_forward"), maybe_activation_offloading(config.model.ac_offloading):
+                    teacher_out = forward(
+                        model,
+                        packed_teacher_ids,
+                        packed_teacher_pos,
+                        labels=None,
+                        temperature=None,
                     )
-                teacher_selected_logits[seq_idx] = continuation_logits[seq_effective_mask].detach()
-    finally:
-        copy_params_(model_params, student_param_snapshot)
+                teacher_logits = teacher_out.get("logits")
+                if teacher_logits is None:
+                    raise RuntimeError(
+                        "Teacher forward did not return logits in self-distill mode. "
+                        "Ensure fused LM head is disabled."
+                    )
+
+                teacher_aligned_logits = shift_logits(teacher_logits).squeeze(0)
+                split_teacher_logits = teacher_aligned_logits.split(teacher_seq_lengths, dim=0)
+
+                for teacher_idx, (seq_teacher_logits, prompt_len) in enumerate(
+                    zip(split_teacher_logits, teacher_prompt_lengths)
+                ):
+                    orig_seq_idx = included_seq_indices[teacher_idx]
+                    seq_input_ids = split_input_ids[orig_seq_idx]
+                    seq_effective_mask = effective_masks[orig_seq_idx]
+                    if not seq_effective_mask.any():
+                        continue
+                    continuation_logits = seq_teacher_logits[prompt_len:]
+                    if continuation_logits.shape[0] != seq_input_ids.numel():
+                        raise RuntimeError(
+                            "Failed to align teacher logits to continuation tokens: "
+                            f"run_idx={run_idx}, step={step}, micro_step={micro_step}, sequence_index={orig_seq_idx}, "
+                            f"continuation_tokens={seq_input_ids.numel()}, aligned_teacher_tokens={continuation_logits.shape[0]}"
+                        )
+                    teacher_selected_logits[orig_seq_idx] = continuation_logits[seq_effective_mask].detach()
+        finally:
+            copy_params_(model_params, student_param_snapshot)
 
     with maybe_record_function("forward"), maybe_activation_offloading(config.model.ac_offloading):
         student_out = forward(
