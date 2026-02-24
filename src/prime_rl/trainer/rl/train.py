@@ -66,6 +66,27 @@ from ring_flash_attn import substitute_hf_flash_attn
 from torchtitan.distributed.utils import clip_grad_norm_
 
 
+def _format_kl_heatmap(token_ids: torch.Tensor, kl_values: torch.Tensor, tokenizer) -> str:
+    """Build an ANSI-colored string where each token's background reflects its KL divergence.
+
+    Green = low KL (student agrees with teacher), Red = high KL (student disagrees).
+    """
+    tokens = tokenizer.convert_ids_to_tokens(token_ids.tolist())
+    kl = kl_values.float().cpu()
+    max_kl = max(kl.max().item(), 1e-6)
+
+    # ANSI 256-color codes: 28=green, 64=olive, 100=dark yellow, 136=yellow, 172=orange, 208=red-orange, 196=red
+    color_ramp = [28, 64, 100, 136, 172, 208, 196]
+    parts = []
+    for tok, kl_val in zip(tokens, kl):
+        intensity = min(kl_val.item() / max_kl, 1.0)
+        idx = min(int(intensity * (len(color_ramp) - 1)), len(color_ramp) - 1)
+        color = color_ramp[idx]
+        tok_str = tokenizer.convert_tokens_to_string([tok])
+        parts.append(f"\033[48;5;{color}m\033[97m{tok_str}\033[0m")
+    return "".join(parts)
+
+
 def _compute_self_distill_loss_scale(
     micro_batches: list[TensorMicroBatch], loss_config: SelfDistillLossConfig
 ) -> int:
@@ -97,6 +118,7 @@ def _compute_self_distill_microbatch_loss(
     loss_scale: int,
     ema_state: list[torch.Tensor],
     maybe_record_function,
+    tokenizer=None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
     response_lengths = get_response_lengths(position_ids)
     split_input_ids = input_ids.squeeze(0).split(response_lengths)
@@ -223,6 +245,7 @@ def _compute_self_distill_microbatch_loss(
     split_student_logits = student_aligned_logits.squeeze(0).split(response_lengths, dim=0)
 
     distill_token_losses: list[torch.Tensor] = []
+    heatmap_seq: tuple[torch.Tensor, torch.Tensor] | None = None
     total_distill_loss = torch.zeros((), device=input_ids.device, dtype=torch.float32)
     for seq_idx, (student_seq_logits, seq_effective_mask, teacher_seq_logits) in enumerate(
         zip(split_student_logits, effective_masks, teacher_selected_logits)
@@ -246,6 +269,15 @@ def _compute_self_distill_microbatch_loss(
         ).squeeze(0)
         distill_token_losses.append(seq_token_losses)
         total_distill_loss = total_distill_loss + seq_token_losses.sum()
+
+        if heatmap_seq is None:
+            masked_token_ids = split_input_ids[seq_idx][seq_effective_mask]
+            heatmap_seq = (masked_token_ids, seq_token_losses)
+
+    if micro_step == 0 and heatmap_seq is not None and tokenizer is not None:
+        hm_ids, hm_kl = heatmap_seq
+        heatmap_str = _format_kl_heatmap(hm_ids, hm_kl, tokenizer)
+        logger.info(f"KL HEATMAP (step {step}):\n{heatmap_str}")
 
     if distill_token_losses:
         distill_kl = torch.cat(distill_token_losses, dim=0)
@@ -623,6 +655,7 @@ def train(config: RLTrainerConfig):
                     loss_scale=loss_scale,
                     ema_state=ema_state,
                     maybe_record_function=maybe_record_function,
+                    tokenizer=tokenizer,
                 )
             else:
                 # Forward pass with per-token temperatures
